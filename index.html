@@ -2,44 +2,116 @@
 
 <head>
   <title>Two Hundred Fifty Things an Audio DSP Engineer Should Know</title>
+  <style>
+    .center {
+	font-family: "Palatino", Times, serif;
+	margin: auto;
+	width: 50%;
+	line-height: 1.3;
+    }
+    .header {
+	font-family: "Palatino", Times, serif;
+	font-style: normal;
+	font-weight: normal;
+	font-variant: small-caps;
+	margin: auto;
+	width: 50%;
+	text-align:center;
+    }
+    .subheader {
+	font-family: "Palatino", Times, serif;
+	font-style: normal;
+	font-weight: normal;
+	font-variant: normal;
+	margin: auto;
+	width: 50%;
+	text-align:center;
+    }
+  </style>
 </head>
 
-
 <body>
-  <h1>TWO HUNDRED FIFTY THINGS AN AUDIO DSP ENGINEER SHOULD KNOW</h1>
-
-  <h3> With apologies to <a href="ReadingDesign.org/250-things">Michael Sorkin</a> </h3>
+  <div class="header">
+    <h1>two hundred fifty things<br>an audio dsp engineer<br>should know</h1>
+  </div>
+  <div class="subheader">
+    <h3> With apologies to <a href="http://readingdesign.org/250-things">Michael Sorkin</a> </h3>
+  </div>
   
-  <ol>
-    <li>How the Fourier Transform works.</li>
-    <li>And the FFT.</li>
-    <li>The non-associativity of floating point arithmetic.</li>
-    <li>The effect of applying windowing functions.</li>
-    <li>Euler's constant.</li>
-    <li>Pi.</li>
-    <li>The true cost of division.</li>
-    <li>Floating point arithmetic.</li>
-    <li>The cost of a cache miss.</li>
-    <li>The bilinear transform.</li>
-    <li>The matched-Z transform.</li>
-    <li>The impulse-invariant transform.</li>
-    <li>The Fletcher-Munson contours.</li>
-    <li>Phase response given poles and zeros.</li>
-    <li>The number of clock cycles in a frame.</li>
-    <li>The colours of noise.</li>
-    <li>The sound of your noise floor.<li>
-    <li>The conics.</li>
-    <li>Anything about elliptic functions and curves.</li>
-    <li>The Chebyshev polynomials.</li>
-    <li>CORDIC.</li>
-    <li>The sum and difference identities.</li>
-    <li>Double-angle identities.</li>
-    <li>Taylor series expansion of e^x</li>
-    <li>The Taylor series expansion of ln(x)</li>
-    <li>The hyperbolic functions.</li>
-    <li>Jackson's law.</li>
-    <li>Horner's method.</li>
-    <li>John Dattoro's Papers.</li>
-    
-  </ol>
+  <div class="center">
+    <ol>
+      <li>How the Fourier Transform works.</li>
+      <li>And the FFT.</li>
+      <li>The non-associativity of floating point arithmetic.</li>
+      <li>The effect of applying windowing functions.</li>
+      <li>Euler's constant.</li>
+      <li>Pi.</li>
+      <li>The true cost of division.</li>
+      <li>Floating point arithmetic.</li>
+      <li>The cost of a cache miss.</li>
+      <li>The bilinear transform.</li>
+      <li>The matched-Z transform.</li>
+      <li>The impulse-invariant transform.</li>
+      <li>The Fletcher-Munson contours.</li>
+      <li>Phase response given poles and zeros.</li>
+      <li>The number of clock cycles in a frame.</li>
+      <li>The colours of noise.</li>
+      <li>The sound of your noise floor.</li>
+      <li>The conics.</li>
+      <li>Anything about elliptic functions and curves.</li>
+      <li>The Chebyshev polynomials.</li>
+      <li>CORDIC.</li>
+      <li>The sum and difference identities.</li>
+      <li>Double-angle identities.</li>
+      <li>Taylor series expansion of e<sup>x</sup></li>
+      <li>The Taylor series expansion of ln(x)</li>
+      <li>The hyperbolic functions.</li>
+      <li>Jackson's law.</li>
+      <li>Horner's method.</li>
+      <li>John Dattoro's Papers.</li>
+      <li>JOS III's website.</li>
+      <li>The impact of coefficient quantisation.</li>
+      <li>The Noble Identities.</li>
+      <li>How to build a perfect-reconstruction QMFB.</li>
+      <li>The Linkwitz-Riley crossover.</li>
+      <li>The Butterworth filter.</li>
+      <li>The Chebyshev filter.</li>
+      <li>The Bessel filter.</li>
+      <li>The elliptic filter.</li>
+      <li>The real meaning of resonance.</li>
+      <li>State-space representation.</li>
+      <li>How to design an all-pass filter.</li>
+      <li>The length of latency in meters.</li>
+      <li>The behaviour of an LA2A.</li>
+      <li>The sound of an 1176.</li>
+      <li></li><li></li><li></li><li></li><li></li><li></li><li></li><li></li>
+      <li></li><li></li><li></li><li></li><li></li><li></li><li></li><li></li>
+      <li></li><li></li><li></li><li></li><li></li><li></li><li></li><li></li>
+      <li></li><li></li><li></li><li></li><li></li><li></li><li></li><li></li>
+      <li></li><li></li><li></li><li></li><li></li><li></li><li></li><li></li>
+      <li></li><li></li><li></li><li></li><li></li><li></li><li></li><li></li>
+      <li></li><li></li><li></li><li></li><li></li><li></li><li></li><li></li>
+      <li></li><li></li><li></li><li></li><li></li><li></li><li></li><li></li>
+      <li></li><li></li><li></li><li></li><li></li><li></li><li></li><li></li>
+      <li></li><li></li><li></li><li></li><li></li><li></li><li></li><li></li>
+      <li></li><li></li><li></li><li></li><li></li><li></li><li></li><li></li>
+      <li></li><li></li><li></li><li></li><li></li><li></li><li></li><li></li>
+      <li></li><li></li><li></li><li></li><li></li><li></li><li></li><li></li>
+      <li></li><li></li><li></li><li></li><li></li><li></li><li></li><li></li>
+      <li></li><li></li><li></li><li></li><li></li><li></li><li></li><li></li>
+      <li></li><li></li><li></li><li></li><li></li><li></li><li></li><li></li>
+      <li></li><li></li><li></li><li></li><li></li><li></li><li></li><li></li>
+      <li></li><li></li><li></li><li></li><li></li><li></li><li></li><li></li>
+      <li></li><li></li><li></li><li></li><li></li><li></li><li></li><li></li>
+      <li></li><li></li><li></li><li></li><li></li><li></li><li></li><li></li>
+      <li></li><li></li><li></li><li></li><li></li><li></li><li></li><li></li>
+      <li></li><li></li><li></li><li></li><li></li><li></li><li></li><li></li>
+      <li></li><li></li><li></li><li></li><li></li><li></li><li></li><li></li>
+      <li></li><li></li><li></li><li></li><li></li><li></li><li></li><li></li>
+      <li></li><li></li><li></li><li></li><li></li><li></li><li></li><li></li>
+      <li></li><li></li><li></li><li></li><li></li><li></li>
+      
+    </ol>
+  </div>
+  
 </body>
