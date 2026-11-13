@@ -1,0 +1,583 @@
+<!doctype html><html><head><meta charset="utf-8"><meta name=viewport content="width=device-width,initial-scale=1,viewport-fit=cover"><style>:root{color-scheme:light;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}html{scroll-padding-top:env(safe-area-inset-top,0px)}body{margin:0;padding:0;font:14px -apple-system,BlinkMacSystemFont,sans-serif;background:#fff;color:#000}img{max-width:100%}[hidden]:not([hidden=until-found i]){display:none!important}</style><title>Tape Delay Board</title></head><body>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Permanent+Marker&family=Caveat:wght@600&display=swap">
+<style>
+/* Layout: one wooden board seen from above, scaled to fit the window; a wider, bigger-control arrangement for landscape phones. Single committed look. */
+:root{
+  --bench:#1c120a; --wood:#b8894f; --ink:#22140a; --ink-red:#9e1e12; --note:#f1e6cf;
+  --marker:'Permanent Marker','Comic Sans MS',cursive; --pencil:'Caveat','Segoe Print',cursive;
+  color-scheme:dark;
+}
+html,body{height:100%}
+body{margin:0;background:var(--bench);color:var(--note);font-family:var(--pencil);overflow:hidden;overscroll-behavior:none}
+#wrap{box-sizing:border-box;height:100%;display:flex;align-items:center;justify-content:center;padding-block:8px;
+  padding-left:max(16px,env(safe-area-inset-left,0px));padding-right:max(16px,env(safe-area-inset-right,0px))}
+#stage{position:relative;border-radius:10px;overflow:hidden;box-shadow:0 12px 44px rgba(0,0,0,.7);background:var(--wood)}
+#stage svg,#stage canvas{position:absolute;inset:0;width:100%;height:100%;display:block}
+#anim{pointer-events:none}
+#board{touch-action:none;user-select:none;-webkit-user-select:none}
+#board .ctl{cursor:pointer;outline:none}
+#board .drag{cursor:grab}
+#board .ctl:focus-visible .ring{stroke:#fff6d8;stroke-opacity:.9}
+#board .ring{fill:none;stroke:#fff6d8;stroke-opacity:0;stroke-width:4;stroke-dasharray:6 6}
+#hint{position:fixed;left:0;right:0;bottom:calc(10px + env(safe-area-inset-bottom,0px));text-align:center;font-size:22px;color:var(--note);pointer-events:none;padding-inline:16px}
+</style>
+
+<div id="wrap"><div id="stage"><canvas id="wood" aria-hidden="true"></canvas><svg id="board" role="group" aria-label="Tape delay board"></svg><canvas id="anim" aria-hidden="true"></canvas></div></div>
+<div id="hint" hidden>Turn the phone sideways for bigger controls</div>
+<script>
+/*ENGINE*/
+class TapeEngine{
+  constructor(sr){
+    this.sr=sr;this.N=1<<19;this.M=this.N-1;
+    this.buf=new Float32Array(this.N);   // what was recorded
+    this.pos=new Float64Array(this.N);   // tape coordinate (cm) where each sample sits
+    this.wn=0;this.x=0;this.vb=0;
+    this.p={motor:0,speed:19.05,rec:0.5,wob:0.25,master:0.7};
+    this.h=[];
+    for(let i=0;i<4;i++)this.h.push({d:4+i*5,ds:4+i*5,on:0,g:0,gs:0,r:0,l1:0,l2:0,x1:0,x2:0,y1:0,y2:0,dcx:0,dcy:0});
+    this.dxMin=3.5/sr;this.acc=0;this.accN=0;this.accDx=0;this.prevIn=0;
+    this.ph1=0;this.ph2=0;this.ph3=0;this.drift=0;this.seed=22222;
+    this.inPk=0;this.outPk=0;this.ms=0;
+  }
+  set(m){
+    const p=this.p;
+    if(m.motor!==undefined)p.motor=m.motor?1:0;
+    if(m.speed!==undefined)p.speed=Math.min(60,Math.max(1,+m.speed||19.05));
+    if(m.rec!==undefined)p.rec=+m.rec;
+    if(m.wob!==undefined)p.wob=+m.wob;
+    if(m.master!==undefined)p.master=+m.master;
+    if(m.heads)for(let i=0;i<this.h.length&&i<m.heads.length;i++){
+      const s=m.heads[i],h=this.h[i];
+      h.d=Math.min(30,Math.max(0.5,+s.d||1));h.on=s.on?1:0;h.g=+s.g||0;
+    }
+  }
+  rnd(){this.seed=(this.seed*1664525+1013904223)>>>0;return this.seed/2147483648-1;}
+  process(inp,out){
+    const sr=this.sr,p=this.p,n=out.length,buf=this.buf,pos=this.pos,M=this.M,N=this.N,H=this.h;
+    const drv=0.5*Math.pow(16,p.rec),mk=drv>1?1/Math.sqrt(drv):1;
+    const vT=p.motor?p.speed:0,cV=1-Math.exp(-1/((p.motor?0.25:0.45)*sr));
+    const cD=1-Math.exp(-1/(0.06*sr)),cG=1-Math.exp(-1/(0.015*sr)),cDr=1-Math.exp(-2*Math.PI*0.3/sr);
+    const wd=p.wob*4,tw=2*Math.PI/sr,TWO=2*Math.PI;
+    // playback loss: cut-off follows tape speed (shorter wavelengths at low speed)
+    const vref=Math.max(this.vb,0.5);
+    const fc=Math.min(600*vref,0.45*sr),a=1-Math.exp(-2*Math.PI*fc/sr);
+    // head bump: small low peak that also follows speed
+    const f0=Math.max(30,2.2*vref),A=Math.pow(10,2.5/40),w0=2*Math.PI*f0/sr,al=Math.sin(w0)/2.4,cs=Math.cos(w0);
+    const a0=1+al/A,b0=(1+al*A)/a0,b1=-2*cs/a0,b2=(1-al*A)/a0,a2=(1-al/A)/a0;
+    const dcR=1-2*Math.PI*20/sr;
+    for(let i=0;i<n;i++){
+      // transport
+      this.vb+=(vT-this.vb)*cV;if(!p.motor&&this.vb<0.02)this.vb=0;
+      this.ph1+=tw*0.55;if(this.ph1>TWO)this.ph1-=TWO;
+      this.ph2+=tw*this.vb*0.25;if(this.ph2>TWO)this.ph2-=TWO;
+      this.ph3+=tw*9.3;if(this.ph3>TWO)this.ph3-=TWO;
+      this.drift+=(this.rnd()-this.drift)*cDr;
+      const v=this.vb*(1+wd*(0.0035*Math.sin(this.ph1)+0.0012*Math.sin(this.ph2)+0.0006*Math.sin(this.ph3)+0.5*this.drift));
+      const dx=v>0?v/sr:0;this.x+=dx;
+      // record head
+      const xin=inp?inp[i]:0,ax=xin<0?-xin:xin;if(ax>this.inPk)this.inPk=ax;
+      const mid=0.5*(xin+this.prevIn);this.prevIn=xin;
+      const s=0.5*(Math.tanh(drv*mid)+Math.tanh(drv*xin))*mk;
+      this.acc+=s;this.accN++;this.accDx+=dx;
+      if(this.accDx>=this.dxMin){const k=this.wn&M;buf[k]=this.acc/this.accN;pos[k]=this.x;this.wn++;this.acc=0;this.accN=0;this.accDx=0;}
+      else if(this.accN>64){this.acc*=0.5;this.accN*=0.5;}
+      // playback heads
+      const gate=v>=3.5?1:v/3.5,wn=this.wn,first=wn>N-2?wn-N+2:0;
+      let sum=0;
+      for(let j=0;j<H.length;j++){
+        const h=H[j];
+        h.ds+=(h.d-h.ds)*cD;h.gs+=((h.on?h.g:0)-h.gs)*cG;
+        let y=0;
+        if(wn-first>=6){
+          const xr=this.x-h.ds;let r=h.r;
+          if(r<first+1)r=first+1;if(r>wn-3)r=wn-3;
+          while(r<wn-3&&pos[(r+1)&M]<=xr)r++;
+          while(r>first+1&&pos[r&M]>xr)r--;
+          h.r=r;
+          const p0=pos[r&M],p1=pos[(r+1)&M];let f=(xr-p0)/(p1-p0);
+          if(f>=0){
+            if(f>1)f=1;
+            const ym=buf[(r-1)&M],y0=buf[r&M],y1=buf[(r+1)&M],y2=buf[(r+2)&M];
+            const c1=0.5*(y1-ym),c2=ym-2.5*y0+2*y1-0.5*y2,c3=0.5*(y2-ym)+1.5*(y0-y1);
+            y=((c3*f+c2)*f+c1)*f+y0;
+          }
+        }
+        if(!h.on&&h.gs<1e-5)continue;
+        y=(y+this.rnd()*0.0005)*gate;
+        h.l1+=a*(y-h.l1);h.l2+=a*(h.l1-h.l2);y=h.l2;
+        const yb=b0*y+b1*h.x1+b2*h.x2-b1*h.y1-a2*h.y2;h.x2=h.x1;h.x1=y;h.y2=h.y1;h.y1=yb;
+        const yd=yb-h.dcx+dcR*h.dcy;h.dcx=yb;h.dcy=yd;
+        sum+=yd*h.gs;
+      }
+      this.ms+=(p.master-this.ms)*cG;
+      const o=Math.tanh(sum*this.ms*1.4);out[i]=o;
+      const ao=o<0?-o:o;if(ao>this.outPk)this.outPk=ao;
+    }
+  }
+  meter(){const m={x:this.x,v:this.vb,i:this.inPk,o:this.outPk};this.inPk=0;this.outPk=0;return m;}
+}
+/*END*/
+
+(function(){
+'use strict';
+const WORKLET_SRC=`
+class TapeProcessor extends AudioWorkletProcessor{
+  constructor(){super();this.e=new TapeEngine(sampleRate);this.c=0;this.port.onmessage=ev=>this.e.set(ev.data);}
+  process(inputs,outputs){
+    const o=outputs[0],i=inputs[0]&&inputs[0][0];
+    this.e.process(i,o[0]);
+    for(let c=1;c<o.length;c++)o[c].set(o[0]);
+    this.c+=o[0].length;
+    if(this.c>=sampleRate/30){this.c=0;this.port.postMessage(this.e.meter());}
+    return true;
+  }
+}
+registerProcessor('tape',TapeProcessor);`;
+
+/* ---------- state ---------- */
+const MIN_D=1.5,MAX_D=24;
+const state={motor:0,speed:2/3,rec:0.5,wob:0.25,master:0.7,src:'mic',
+  heads:[{d:4,on:1,g:0.8},{d:8,on:1,g:0.6},{d:14,on:0,g:0.5},{d:22,on:1,g:0.4}]};
+try{
+  const s=JSON.parse(localStorage.getItem('tapeboard')||'null');
+  if(s&&Array.isArray(s.heads)&&s.heads.length===4){
+    ['speed','rec','wob','master'].forEach(k=>{if(typeof s[k]==='number')state[k]=Math.min(1,Math.max(0,s[k]));});
+    if(s.src==='mic'||s.src==='test')state.src=s.src;
+    s.heads.forEach((h,i)=>{state.heads[i]={d:Math.min(MAX_D,Math.max(MIN_D,+h.d||4)),on:h.on?1:0,g:Math.min(1,Math.max(0,+h.g||0))};});
+  }
+}catch(e){}
+function save(){try{localStorage.setItem('tapeboard',JSON.stringify({speed:state.speed,rec:state.rec,wob:state.wob,master:state.master,src:state.src,heads:state.heads}));}catch(e){}}
+const speedCm=()=>4.7625*Math.pow(8,state.speed);
+
+/* ---------- audio ---------- */
+const A={ctx:null,post:null,mic:null,micGain:null,testGain:null,micOk:false,msg:'tap GO to start'};
+const vis={x:0,v:0,t:0,inPk:0,outPk:0,needle:0,live:false};
+function onMeter(m){vis.x=m.x;vis.v=m.v;vis.t=performance.now();vis.live=true;vis.inPk=Math.max(vis.inPk*0.8,m.i);vis.outPk=Math.max(vis.outPk*0.85,m.o);}
+function pushParams(){if(A.post)A.post({motor:state.motor,speed:speedCm(),rec:state.rec,wob:state.wob,master:state.master,heads:state.heads});}
+function makeTest(ctx){
+  // one bar at 120 bpm: kick on 1 and 3, snare on 2 and 4, hi-hat on the eighths
+  const sr=ctx.sampleRate,len=Math.round(sr*2),b=ctx.createBuffer(1,len,sr),d=b.getChannelData(0);
+  let seed=12345;const rnd=()=>{seed=(seed*1664525+1013904223)>>>0;return seed/2147483648-1;};
+  const add=(t0,dur,fn)=>{const s0=Math.round(t0*sr),n=Math.round(dur*sr);for(let i=0;i<n;i++)d[(s0+i)%len]+=fn(i/sr);};
+  const kick=t0=>{let ph=0;add(t0,0.32,t=>{ph+=2*Math.PI*(48+110*Math.exp(-t*28))/sr;return 0.85*Math.sin(ph)*Math.exp(-t*11)*Math.min(1,t*800);});};
+  const snare=t0=>{let lp=0;add(t0,0.22,t=>{const n=rnd();lp+=0.25*(n-lp);return (0.5*(n-lp)*Math.exp(-t*20)+0.3*Math.sin(2*Math.PI*190*t)*Math.exp(-t*30))*Math.min(1,t*1500);});};
+  const hat=(t0,g)=>{let p=0;add(t0,0.06,t=>{const n=rnd(),h=n-p;p=n;return g*0.22*h*Math.exp(-t*90);});};
+  kick(0);kick(1);kick(1.75);snare(0.5);snare(1.5);
+  for(let i=0;i<8;i++)hat(i*0.25,i%2?0.6:1);
+  let pk=0;for(let i=0;i<len;i++)pk=Math.max(pk,Math.abs(d[i]));for(let i=0;i<len;i++)d[i]*=0.7/pk;
+  const n=ctx.createBufferSource();n.buffer=b;n.loop=true;n.connect(A.testGain);n.start();
+}
+async function initAudio(){
+  if(A.ctx){if(A.ctx.state!=='running')A.ctx.resume();return;}
+  const AC=window.AudioContext||window.webkitAudioContext;
+  if(!AC){A.msg='no web audio in this browser';return;}
+  const ctx=new AC({latencyHint:'interactive'});A.ctx=ctx;
+  let node=null;
+  try{
+    const url=URL.createObjectURL(new Blob([TapeEngine.toString()+WORKLET_SRC],{type:'application/javascript'}));
+    await ctx.audioWorklet.addModule(url);
+    node=new AudioWorkletNode(ctx,'tape',{numberOfInputs:1,numberOfOutputs:1,outputChannelCount:[1],channelCount:1,channelCountMode:'explicit',channelInterpretation:'speakers'});
+    node.port.onmessage=e=>onMeter(e.data);
+    A.post=m=>node.port.postMessage(m);
+  }catch(err){
+    // older browsers: same engine on the main thread
+    const eng=new TapeEngine(ctx.sampleRate);
+    node=ctx.createScriptProcessor(1024,1,1);
+    node.onaudioprocess=ev=>{eng.process(ev.inputBuffer.getChannelData(0),ev.outputBuffer.getChannelData(0));onMeter(eng.meter());};
+    A.post=m=>eng.set(m);
+  }
+  node.connect(ctx.destination);
+  A.micGain=ctx.createGain();A.testGain=ctx.createGain();A.micGain.gain.value=0;A.testGain.gain.value=0;
+  A.micGain.connect(node);A.testGain.connect(node);
+  makeTest(ctx);
+  pushParams();
+  if(ctx.state!=='running')ctx.resume();
+  await useSource(state.src);
+}
+async function useSource(src){
+  state.src=src;
+  if(!A.ctx){updateAll();return;}
+  if(src==='mic'&&!A.mic){
+    try{
+      if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia)throw new Error('no mic api');
+      const stream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false}});
+      A.mic=A.ctx.createMediaStreamSource(stream);A.mic.connect(A.micGain);A.micOk=true;
+    }catch(err){A.micOk=false;state.src='test';A.msg='no mic here, playing test beat';}
+  }
+  const t=A.ctx.currentTime;
+  A.micGain.gain.setTargetAtTime(state.src==='mic'?1:0,t,0.02);
+  A.testGain.gain.setTargetAtTime(state.src==='test'?1:0,t,0.02);
+  if(state.src==='mic'&&A.micOk)A.msg='mic live, use headphones';
+  else if(state.src==='test'&&(A.micOk||!A.msg.startsWith('no mic')))A.msg='test beat playing';
+  updateAll();
+}
+
+/* ---------- layouts ---------- */
+const LAY={
+  desk:{W:1600,H:1000,fs:1,topY:300,botY:520,dl:260,dr:1340,erX:330,recX:420,ppc:36,headY:220,ruler:true,vu:true,title:true,
+    motor:{x:190,y:790,s:2.3,go:[266,712],stop:[108,884],name:[196,934]},
+    speed:{x:425,y:790,r:52,name:938,side:898,note:684},
+    rec:{x:640,y:815,r:37,name:906},wob:{x:790,y:815,r:37,name:906},
+    src:{lx:566,ly:682,tx:626,ty:686,s:1,status:[548,630]},
+    fad:{xs:[980,1090,1200,1310,1470],y:690,w:68,h:240,togY:650,togS:1,lblY:968}},
+  phone:{W:1600,H:760,fs:1.25,topY:150,botY:290,dl:170,dr:1430,erX:250,recX:330,ppc:42,headY:74,ruler:false,vu:false,title:false,
+    motor:{x:150,y:545,s:3.4,go:[238,436],stop:[64,650],name:[150,712]},
+    speed:{x:405,y:545,r:92,name:728,side:676,note:378},
+    rec:{x:655,y:570,r:62,name:694},wob:{x:835,y:570,r:62,name:694},
+    src:{lx:580,ly:352,tx:652,ty:358,s:1.5,status:[566,432]},
+    fad:{xs:[1010,1130,1250,1370,1510],y:400,w:92,h:300,togY:352,togS:1.6,lblY:748}}
+};
+let mode='desk',G=LAY.desk;
+const stage=document.getElementById('stage'),svg=document.getElementById('board'),wood=document.getElementById('wood'),hint=document.getElementById('hint');
+const el={};
+
+/* ---------- drawing helpers ---------- */
+const INK='#22140A';
+function scr(x,y,size,txt,rot,extra){return `<text x="${x}" y="${y}" font-family="Permanent Marker, Comic Sans MS, cursive" font-size="${size}" fill="${INK}" fill-opacity="0.88" text-anchor="middle" ${rot?`transform="rotate(${rot} ${x} ${y})"`:''} ${extra||''}>${txt}</text>`;}
+function note(x,y,size,txt,rot,extra){return `<text x="${x}" y="${y}" font-family="Caveat, Segoe Print, cursive" font-weight="600" font-size="${size}" fill="${INK}" fill-opacity="0.85" text-anchor="middle" ${rot?`transform="rotate(${rot} ${x} ${y})"`:''} ${extra||''}>${txt}</text>`;}
+const INKS=[];
+function ink(x,y,size,txt,rot){INKS.push({t:'text',x,y,size,txt,rot:rot||0});return '';}
+function inkPath(d,w){INKS.push({t:'path',d,w});return '';}
+function jewel(attr,x,y,r){
+  return `<g class="jw"><circle cx="${x}" cy="${y}" r="${r*2.8}" fill="url(#glowg)" opacity="0" pointer-events="none"></circle>
+  <circle cx="${x}" cy="${y}" r="${r*1.6}" fill="url(#steel)" stroke="#4D5257" stroke-width="1"></circle><circle cx="${x}" cy="${y}" r="${r*1.22}" fill="#17191B"></circle>
+  <circle ${attr} cx="${x}" cy="${y}" r="${r}" fill="url(#ledoff)"></circle>
+  <ellipse cx="${x-r*0.3}" cy="${y-r*0.36}" rx="${r*0.36}" ry="${r*0.2}" fill="#fff" opacity="0.55" pointer-events="none"></ellipse></g>`;
+}
+function setLamp(n,k){n.setAttribute('fill','url(#led'+k+')');const g=n.parentNode.firstElementChild;g.setAttribute('fill',k==='r'?'url(#glowr)':'url(#glowg)');g.setAttribute('opacity',(k==='g'||k==='r')?'0.85':'0');}
+function slotScrew(x,y,r,a){return `<g transform="rotate(${a} ${x} ${y})"><circle cx="${x}" cy="${y}" r="${r}" fill="url(#steel)" stroke="#4A4F54" stroke-width="1"></circle><line x1="${x-r*0.7}" y1="${y}" x2="${x+r*0.7}" y2="${y}" stroke="#24272A" stroke-width="${Math.max(1.2,r*0.3)}"></line></g>`;}
+function toggle(id,x,y,s,label){
+  let hex='';for(let i=0;i<6;i++){const a=i*Math.PI/3+0.26;hex+=(x+Math.cos(a)*12.5*s).toFixed(1)+','+(y+Math.sin(a)*12.5*s).toFixed(1)+' ';}
+  return `<g id="${id}" class="ctl" tabindex="0" role="switch" aria-label="${label}">
+  <circle class="ring" cx="${x}" cy="${y}" r="${30*s}"></circle>
+  <circle cx="${x}" cy="${y}" r="${30*s}" fill="#000" fill-opacity="0"></circle>
+  <g filter="url(#shs)"><circle cx="${x}" cy="${y}" r="${16.5*s}" fill="url(#steel)" stroke="#565B61" stroke-width="1.2"></circle></g>
+  <circle cx="${x}" cy="${y}" r="${14.6*s}" fill="none" stroke="#fff" stroke-opacity="0.35" stroke-width="1"></circle>
+  <polygon points="${hex}" fill="url(#steelv)" stroke="#4A4F54" stroke-width="1.2"></polygon>
+  <circle cx="${x}" cy="${y}" r="${7.5*s}" fill="#222528"></circle><circle cx="${x}" cy="${y}" r="${5.5*s}" fill="#0C0D0E"></circle>
+  <g class="bat" transform="translate(${x} ${y})"><line x1="0" y1="0" x2="${9*s}" y2="${-25*s}" stroke="#3B3F43" stroke-width="${9.6*s}" stroke-linecap="round"></line>
+  <line x1="0" y1="0" x2="${9*s}" y2="${-25*s}" stroke="url(#steelv)" stroke-width="${8.2*s}" stroke-linecap="round"></line>
+  <line x1="${-1.4*s}" y1="${-2*s}" x2="${6.8*s}" y2="${-24*s}" stroke="#fff" stroke-opacity="0.6" stroke-width="${1.4*s}" stroke-linecap="round"></line>
+  <circle cx="${9*s}" cy="${-25*s}" r="${5.9*s}" fill="url(#ball)" stroke="#7D8389" stroke-width="1"></circle></g></g>`;
+}
+function knob(id,x,y,r,label){
+  for(let i=0;i<7;i++){const a=(-135+i*45+(i%2?3:-2))*Math.PI/180,r1=r*1.5,r2=r*1.78+(i%3)*2;
+    inkPath(`M${(x+Math.sin(a)*r1).toFixed(1)} ${(y-Math.cos(a)*r1).toFixed(1)} L${(x+Math.sin(a)*r2).toFixed(1)} ${(y-Math.cos(a)*r2).toFixed(1)}`,Math.max(3,r*0.07));}
+  const hx=x-r*0.28,hy=y-r*0.42;
+  return `<g id="${id}" class="ctl" tabindex="0" role="slider" aria-label="${label}" aria-valuemin="0" aria-valuemax="100">
+  <circle class="ring" cx="${x}" cy="${y}" r="${r*1.4}"></circle>
+  <g filter="url(#sh)"><circle cx="${x}" cy="${y}" r="${r*1.27}" fill="#0F0E0D"></circle></g>
+  <circle cx="${x}" cy="${y}" r="${r*1.2}" fill="none" stroke="#3F3A36" stroke-width="${r*0.14}" stroke-dasharray="${(r*0.05).toFixed(2)} ${(r*0.07).toFixed(2)}"></circle>
+  <circle cx="${x}" cy="${y}" r="${r*1.06}" fill="#0A0909"></circle>
+  <circle cx="${x}" cy="${y}" r="${r}" fill="url(#knob)" stroke="#000" stroke-opacity="0.6" stroke-width="1"></circle>
+  <ellipse cx="${hx}" cy="${hy}" rx="${r*0.5}" ry="${r*0.24}" fill="#fff" opacity="0.14" transform="rotate(-30 ${hx} ${hy})"></ellipse>
+  <circle cx="${x}" cy="${y}" r="${r*0.62}" fill="none" stroke="#fff" stroke-opacity="0.07" stroke-width="1.5"></circle>
+  <g class="ptr"><line x1="${x}" y1="${y-r*1.2}" x2="${x}" y2="${y-r*0.5}" stroke="#F4EFE2" stroke-width="${Math.max(4,r*0.1)}" stroke-linecap="round"></line></g></g>`;
+}
+function fader(id,x,y,w,h,label){
+  let ticks='';for(let i=0;i<9;i++){const ty=y+h*0.1+i*h*0.1;ticks+=`<line x1="${x-w*0.4}" y1="${ty}" x2="${x-w*(i%2?0.26:0.16)}" y2="${ty}"></line><line x1="${x+w*(i%2?0.26:0.16)}" y1="${ty}" x2="${x+w*0.4}" y2="${ty}"></line>`;}
+  let ridges='';for(let i=-2;i<=2;i++){if(!i)continue;const ry=i*h*0.022;ridges+=`<line x1="${-w*0.34}" y1="${ry}" x2="${w*0.34}" y2="${ry}" stroke="#000" stroke-opacity="0.55" stroke-width="1.5"></line><line x1="${-w*0.34}" y1="${ry+1.5}" x2="${w*0.34}" y2="${ry+1.5}" stroke="#fff" stroke-opacity="0.13" stroke-width="1"></line>`;}
+  return `<g id="${id}" class="ctl" tabindex="0" role="slider" aria-label="${label}" aria-valuemin="0" aria-valuemax="100" aria-orientation="vertical">
+  <rect class="ring" x="${x-w/2-5}" y="${y-5}" width="${w+10}" height="${h+10}" rx="9"></rect>
+  <g filter="url(#sh)"><rect x="${x-w/2}" y="${y}" width="${w}" height="${h}" rx="5" fill="url(#steelv)" stroke="#565B61" stroke-width="1.5"></rect></g>
+  <rect x="${x-w/2+2}" y="${y+2}" width="${w-4}" height="${h-4}" rx="4" fill="none" stroke="#fff" stroke-opacity="0.45" stroke-width="1"></rect>
+  ${slotScrew(x,y+h*0.04,w*0.07,30)}${slotScrew(x,y+h*0.96,w*0.07,-50)}
+  <rect x="${x-w*0.07}" y="${y+h*0.1-4}" width="${w*0.14}" height="${h*0.8+8}" rx="${w*0.07}" fill="#0B0C0D"></rect>
+  <rect x="${x+w*0.07-1.2}" y="${y+h*0.1}" width="1.2" height="${h*0.8}" fill="#fff" opacity="0.4"></rect>
+  <g stroke="#1C1F22" stroke-width="1.4">${ticks}</g>
+  <g class="cap"><rect x="${-w*0.38+3}" y="${-h*0.065+5}" width="${w*0.76}" height="${h*0.13}" rx="4" fill="#1A0D04" opacity="0.45"></rect>
+  <rect x="${-w*0.38}" y="${-h*0.065}" width="${w*0.76}" height="${h*0.13}" rx="4" fill="url(#capg)" stroke="#000" stroke-width="1"></rect>
+  <rect x="${-w*0.36}" y="${-h*0.06}" width="${w*0.72}" height="${h*0.018}" rx="2" fill="#fff" opacity="0.22"></rect>${ridges}
+  <line x1="${-w*0.34}" y1="0" x2="${w*0.34}" y2="0" stroke="#F2F2F2" stroke-width="2.5"></line></g></g>`;
+}
+function headShape(){
+  return `<g filter="url(#sh)"><rect x="-36" y="-5" width="72" height="17" rx="3" fill="url(#brassl)" stroke="#5E4712" stroke-width="1"></rect>
+  <rect x="-30" y="2" width="60" height="68" rx="7" fill="url(#steel)" stroke="#5B6066" stroke-width="1.5"></rect>
+  <rect x="-12" y="64" width="24" height="12" rx="2" fill="#2B2E31"></rect></g>
+  <rect x="-23" y="20" width="46" height="38" rx="5" fill="#000" opacity="0.13"></rect>
+  <rect x="-27" y="16" width="4" height="50" rx="2" fill="#fff" opacity="0.4"></rect>
+  <line x1="0" y1="64" x2="0" y2="76" stroke="#C9CDD1" stroke-width="1.5"></line>
+  ${slotScrew(-25,3.5,4.5,20)}${slotScrew(25,3.5,4.5,-35)}`;
+}
+function drum(id,x,y,r){
+  const sec=(a1,a2,fill,op)=>{const p=a=>`${(x+Math.cos(a*Math.PI/180)*r*0.97).toFixed(1)} ${(y+Math.sin(a*Math.PI/180)*r*0.97).toFixed(1)}`;return `<path d="M${x} ${y} L${p(a1)} A${r*0.97} ${r*0.97} 0 0 1 ${p(a2)} Z" fill="${fill}" opacity="${op}"></path>`;};
+  let rings='';[0.92,0.84,0.7,0.62,0.44,0.34].forEach(k=>{rings+=`<circle cx="${x}" cy="${y}" r="${r*k}" fill="none" stroke="#000" stroke-opacity="0.09" stroke-width="1.2"></circle>`;});
+  return `<g filter="url(#sh)"><circle cx="${x}" cy="${y}" r="${r}" fill="url(#drum)" stroke="#565B61" stroke-width="2"></circle></g>
+  ${sec(-150,-112,'#fff',0.3)}${sec(30,68,'#fff',0.22)}${sec(-60,-22,'#000',0.1)}${sec(120,158,'#000',0.1)}${rings}
+  <circle cx="${x}" cy="${y}" r="${r*0.75}" fill="none" stroke="#7F858B" stroke-width="1.5"></circle>
+  <circle cx="${x}" cy="${y}" r="${r*0.2}" fill="#2B2E31"></circle><circle cx="${x}" cy="${y}" r="${r*0.16}" fill="url(#brass)" stroke="#4E3A0E" stroke-width="1"></circle>
+  <ellipse cx="${x-r*0.05}" cy="${y-r*0.06}" rx="${r*0.06}" ry="${r*0.04}" fill="#fff" opacity="0.6"></ellipse>`;
+}
+const DEFS=`<defs>
+<filter id="sh" x="-40%" y="-40%" width="180%" height="180%"><feDropShadow dx="4" dy="7" stdDeviation="5" flood-color="#1A0D04" flood-opacity="0.6"></feDropShadow></filter>
+<filter id="shs" x="-40%" y="-40%" width="180%" height="180%"><feDropShadow dx="2" dy="3" stdDeviation="2" flood-color="#1A0D04" flood-opacity="0.6"></feDropShadow></filter>
+<linearGradient id="steel" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#F4F5F6"></stop><stop offset="0.45" stop-color="#A9AEB3"></stop><stop offset="0.6" stop-color="#DADDE0"></stop><stop offset="1" stop-color="#787D83"></stop></linearGradient>
+<linearGradient id="steelv" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#E9EBED"></stop><stop offset="0.5" stop-color="#B4B9BE"></stop><stop offset="1" stop-color="#7F858B"></stop></linearGradient>
+<linearGradient id="capg" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#4A4A4A"></stop><stop offset="0.45" stop-color="#1B1B1B"></stop><stop offset="0.55" stop-color="#3A3A3A"></stop><stop offset="1" stop-color="#0E0E0E"></stop></linearGradient>
+<radialGradient id="drum" cx="38%" cy="32%" r="80%"><stop offset="0" stop-color="#F2F3F4"></stop><stop offset="0.5" stop-color="#B2B7BC"></stop><stop offset="1" stop-color="#6C7278"></stop></radialGradient>
+<radialGradient id="knob" cx="36%" cy="30%" r="80%"><stop offset="0" stop-color="#5A5550"></stop><stop offset="0.5" stop-color="#1E1B19"></stop><stop offset="1" stop-color="#090807"></stop></radialGradient>
+<radialGradient id="brass" cx="35%" cy="30%" r="80%"><stop offset="0" stop-color="#F5E3A1"></stop><stop offset="0.6" stop-color="#B58B32"></stop><stop offset="1" stop-color="#6E5216"></stop></radialGradient>
+<radialGradient id="ledg" cx="38%" cy="32%" r="75%"><stop offset="0" stop-color="#EFFFE0"></stop><stop offset="0.4" stop-color="#5BE04A"></stop><stop offset="1" stop-color="#17701A"></stop></radialGradient>
+<radialGradient id="ledr" cx="38%" cy="32%" r="75%"><stop offset="0" stop-color="#FFE9E0"></stop><stop offset="0.4" stop-color="#F0432A"></stop><stop offset="1" stop-color="#7D130A"></stop></radialGradient>
+<radialGradient id="ledrd" cx="38%" cy="32%" r="75%"><stop offset="0" stop-color="#9A6A62"></stop><stop offset="1" stop-color="#3A0F0A"></stop></radialGradient>
+<radialGradient id="ledoff" cx="38%" cy="32%" r="75%"><stop offset="0" stop-color="#6B7466"></stop><stop offset="1" stop-color="#1F2A1D"></stop></radialGradient>
+<linearGradient id="vuface" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#FBF1CF"></stop><stop offset="1" stop-color="#E4CE8E"></stop></linearGradient>
+<pattern id="cm" width="36" height="16" patternUnits="userSpaceOnUse"><line x1="0.75" y1="0" x2="0.75" y2="12" stroke="#22262A" stroke-width="1.5"></line><line x1="18.75" y1="0" x2="18.75" y2="7" stroke="#22262A" stroke-width="1"></line></pattern>
+<radialGradient id="ball" cx="35%" cy="30%" r="75%"><stop offset="0" stop-color="#FFFFFF"></stop><stop offset="0.5" stop-color="#C9CDD1"></stop><stop offset="1" stop-color="#7B8187"></stop></radialGradient>
+<radialGradient id="glowg"><stop offset="0" stop-color="#7DFF5A" stop-opacity="0.75"></stop><stop offset="1" stop-color="#7DFF5A" stop-opacity="0"></stop></radialGradient>
+<radialGradient id="glowr"><stop offset="0" stop-color="#FF5A3A" stop-opacity="0.8"></stop><stop offset="1" stop-color="#FF5A3A" stop-opacity="0"></stop></radialGradient>
+<linearGradient id="brassl" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#EFD98F"></stop><stop offset="0.5" stop-color="#B58B32"></stop><stop offset="1" stop-color="#7A5B18"></stop></linearGradient>
+</defs>`;
+
+let woodGen=0;
+function drawInks(c){
+  c.save();c.globalCompositeOperation='multiply';c.fillStyle='rgba(34,20,10,0.9)';c.strokeStyle='rgba(34,20,10,0.85)';c.lineCap='round';c.lineJoin='round';c.textAlign='center';
+  INKS.forEach(k=>{
+    if(k.t==='text'){c.save();c.translate(k.x,k.y);c.rotate(k.rot*Math.PI/180);c.font=k.size+'px "Permanent Marker","Comic Sans MS",cursive';c.fillText(k.txt,0,0);c.restore();}
+    else{c.lineWidth=k.w;c.stroke(new Path2D(k.d));}
+  });
+  c.restore();
+}
+function renderWood(){
+  const W=G.W,H=G.H,cy=(G.topY+G.botY)/2,gen=++woodGen;
+  const ys=[0,0.252,0.565,0.79,1].map(f=>Math.round(H*f)),tint=['#C4935A','#B2824A','#BF8F56','#AD7E46'];
+  let fl='',pl='',gaps='';
+  for(let i=0;i<4;i++){
+    fl+=`<filter id="g${i}" x="0" y="0" width="100%" height="100%"><feTurbulence type="fractalNoise" baseFrequency="${0.0016+i*0.0003} ${0.07+i*0.006}" numOctaves="5" seed="${11+i*13}"></feTurbulence><feColorMatrix type="matrix" values="0 0 0 0 0.22  0 0 0 0 0.11  0 0 0 0 0.04  2.6 0 0 0 -0.95"></feColorMatrix></filter>`;
+    pl+=`<rect x="0" y="${ys[i]}" width="${W}" height="${ys[i+1]-ys[i]}" fill="${tint[i]}"></rect><rect x="0" y="${ys[i]}" width="${W}" height="${ys[i+1]-ys[i]}" filter="url(#g${i})"></rect>`;
+    if(i)gaps+=`<line x1="0" y1="${ys[i]}" x2="${W}" y2="${ys[i]}" stroke="#24140A" stroke-opacity="0.85" stroke-width="3"></line><line x1="0" y1="${ys[i]+2.5}" x2="${W}" y2="${ys[i]+2.5}" stroke="#F0CC95" stroke-opacity="0.45" stroke-width="1.2"></line>`;
+  }
+  const knot=(x,y,k)=>`<g transform="translate(${x} ${y}) scale(${k})"><ellipse rx="46" ry="19" fill="#5A3516" opacity="0.35" filter="url(#b6)"></ellipse><ellipse rx="30" ry="12" fill="none" stroke="#4A2A12" stroke-opacity="0.5" stroke-width="2"></ellipse><ellipse rx="20" ry="8" fill="none" stroke="#3E2410" stroke-opacity="0.5" stroke-width="2"></ellipse><ellipse rx="11" ry="5" fill="#2C1808" opacity="0.8"></ellipse></g>`;
+  const src=`<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}"><defs>${fl}
+  <filter id="tone" x="0" y="0" width="100%" height="100%"><feTurbulence type="fractalNoise" baseFrequency="0.003 0.006" numOctaves="2" seed="8"></feTurbulence><feColorMatrix type="matrix" values="0 0 0 0 0.32  0 0 0 0 0.16  0 0 0 0 0.05  1.7 0 0 0 -0.75"></feColorMatrix></filter>
+  <filter id="pore" x="0" y="0" width="100%" height="100%"><feTurbulence type="fractalNoise" baseFrequency="0.03 0.9" numOctaves="2" seed="4"></feTurbulence><feColorMatrix type="matrix" values="0 0 0 0 0.14  0 0 0 0 0.07  0 0 0 0 0.02  1.4 0 0 0 -0.62"></feColorMatrix></filter>
+  <filter id="bump" x="0" y="0" width="100%" height="100%"><feTurbulence type="fractalNoise" baseFrequency="0.006 0.25" numOctaves="3" seed="3"></feTurbulence><feDiffuseLighting surfaceScale="1.6" diffuseConstant="1.15" lighting-color="#ffffff"><feDistantLight azimuth="225" elevation="55"></feDistantLight></feDiffuseLighting></filter>
+  <filter id="b6" x="-50%" y="-50%" width="200%" height="200%"><feGaussianBlur stdDeviation="6"></feGaussianBlur></filter>
+  <filter id="b1" x="-20%" y="-20%" width="140%" height="140%"><feGaussianBlur stdDeviation="1.3"></feGaussianBlur></filter>
+  <radialGradient id="vig" cx="46%" cy="42%" r="78%"><stop offset="0" stop-color="#FFE9C2" stop-opacity="0.12"></stop><stop offset="0.5" stop-color="#000" stop-opacity="0"></stop><stop offset="1" stop-color="#1A0D04" stop-opacity="0.55"></stop></radialGradient></defs>
+  <rect width="${W}" height="${H}" fill="#B98A52"></rect>${pl}
+  <rect width="${W}" height="${H}" filter="url(#tone)" opacity="0.6"></rect>
+  <rect width="${W}" height="${H}" filter="url(#pore)" opacity="0.55"></rect>
+  <rect width="${W}" height="${H}" filter="url(#bump)" opacity="0.5" style="mix-blend-mode:multiply"></rect>
+  ${gaps}${knot(W*0.7,cy+8,1)}${knot(W*0.06,H*0.93,0.7)}${knot(W*0.93,H*0.3,0.55)}
+  ${G.ruler?`<circle cx="150" cy="118" r="58" fill="#5A3415" fill-opacity="0.05" stroke="#5A3415" stroke-opacity="0.3" stroke-width="5" stroke-dasharray="210 16 80 34 30 8" filter="url(#b1)"></circle>`:''}
+  <g stroke="#3B3B3B" stroke-opacity="0.28" stroke-width="1.4" fill="none"><line x1="${G.dl-140}" y1="${cy}" x2="${G.dr+170}" y2="${cy}"></line><line x1="${G.dl}" y1="${G.topY-60}" x2="${G.dl}" y2="${G.botY+50}"></line><line x1="${G.dr}" y1="${G.topY-60}" x2="${G.dr}" y2="${G.botY+50}"></line></g>
+  <g stroke="#F3DDB5" stroke-opacity="0.3" stroke-width="1" fill="none"><path d="M${W*0.42} ${H*0.63} l90 14"></path><path d="M${W*0.2} ${H*0.52} l44 -9"></path><path d="M${W*0.81} ${H*0.6} l-60 22"></path><path d="M${W*0.56} ${H*0.08} l70 5"></path></g>
+  <rect x="3" y="3" width="${W-6}" height="${H-6}" fill="none" stroke="#000" stroke-opacity="0.4" stroke-width="6"></rect>
+  <path d="M1 ${H} V1 H${W}" fill="none" stroke="#F6DDB0" stroke-opacity="0.55" stroke-width="2"></path>
+  <rect width="${W}" height="${H}" fill="url(#vig)"></rect></svg>`;
+  wood.width=W;wood.height=H;const c=wood.getContext('2d');
+  const paint=im=>{if(gen!==woodGen)return;c.globalCompositeOperation='source-over';c.fillStyle='#B8894F';c.fillRect(0,0,W,H);if(im){try{c.drawImage(im,0,0,W,H);}catch(e){}}drawInks(c);};
+  paint(null);
+  const pImg=new Promise(res=>{const im=new Image();im.onload=()=>res(im);im.onerror=()=>res(null);im.src='data:image/svg+xml;charset=utf-8,'+encodeURIComponent(src);});
+  const pFont=(document.fonts&&document.fonts.load)?document.fonts.load('30px "Permanent Marker"').catch(()=>null):Promise.resolve();
+  Promise.all([pImg,pFont]).then(r=>paint(r[0]));
+}
+
+function render(){
+  INKS.length=0;
+  const W=G.W,H=G.H,fs=G.fs,R=(G.botY-G.topY)/2,cy=(G.topY+G.botY)/2;
+  svg.setAttribute('viewBox',`0 0 ${W} ${H}`);
+  const path=`M${G.dl} ${G.topY} H${G.dr} A${R} ${R} 0 0 1 ${G.dr} ${G.botY} H${G.dl} A${R} ${R} 0 0 1 ${G.dl} ${G.topY} Z`;
+  G.len=2*(G.dr-G.dl)+2*Math.PI*R;G.R=R;
+  const per=G.len/Math.round(G.len/130);G.per=per;G.p2=new Path2D(path);
+  let s=DEFS;
+  // corner screws
+  [[36,36,0],[W-36,36,40],[36,H-36,75],[W-36,H-36,-20]].forEach(([x,y,a])=>{s+=`<g filter="url(#shs)" transform="rotate(${a} ${x} ${y})"><circle cx="${x}" cy="${y}" r="11" fill="url(#brass)" stroke="#4E3A0E" stroke-width="1"></circle><line x1="${x-7}" y1="${y-4}" x2="${x+7}" y2="${y+4}" stroke="#4E3A0E" stroke-width="2.5" stroke-linecap="round"></line></g>`;});
+  if(G.vu){
+    s+=`<g filter="url(#sh)"><rect x="1336" y="52" width="196" height="124" rx="8" fill="#161514" stroke="#000" stroke-width="1"></rect><rect x="1348" y="64" width="172" height="92" rx="4" fill="url(#vuface)"></rect></g>
+    <path d="M1366 132 A78 78 0 0 1 1470 86" fill="none" stroke="${INK}" stroke-width="2.5"></path><path d="M1470 86 A78 78 0 0 1 1502 132" fill="none" stroke="#C4271B" stroke-width="5"></path>
+    <text x="1372" y="148" font-family="Georgia, serif" font-size="14" fill="${INK}">VU</text>
+    <rect x="1348" y="150" width="172" height="8" fill="#161514"></rect>`;
+    s+=ink(1262,128,32,'out',4);
+  }
+  // drums, pinch roller
+  s+=drum('drumL',G.dl,cy,R-6)+drum('drumR',G.dr,cy,R-6);
+  s+=`<g filter="url(#sh)"><circle cx="${G.dr+R+22}" cy="${cy}" r="20" fill="#151515" stroke="#000" stroke-width="1"></circle></g><circle cx="${G.dr+R+22}" cy="${cy}" r="6" fill="url(#steel)"></circle>`;
+  if(G.ruler){
+    const x0=G.recX,rw=MAX_D*G.ppc+20;
+    s+=`<g filter="url(#shs)"><rect x="${x0-16}" y="322" width="${rw+24}" height="34" rx="2" fill="url(#steelv)" stroke="#565B61" stroke-width="1"></rect></g><rect x="${x0}" y="322" width="${rw-18}" height="16" fill="url(#cm)"></rect>
+    <g font-family="Georgia, serif" font-size="14" fill="#22262A" text-anchor="middle">${[0,5,10,15,20].map(c=>`<text x="${x0+c*G.ppc+1}" y="352">${c}</text>`).join('')}<text x="${x0+rw-14}" y="352">cm</text></g>`;
+    s+=ink(520,430,28,'tape runs',-2);inkPath('M640 420 C700 412 760 426 838 416',4);inkPath('M818 402 L840 416 L816 432',4);
+    s+=ink(1228,562,24,'capstan + pinch',-3)+ink(196,562,24,'idler',2)+ink(900,630,36,'mixer',-2);
+  }
+  // wiring: each head has a lead to a tag strip (desk) or off the top edge (phone)
+  const WCOL=['#1B1B1B','#B3261A','#D9B21F','#2F8F3A','#2D5FB3','#E8E4D8'];
+  G.term=i=>G.ruler?[404+i*136,76]:[250+i*200,-14];
+  G.wire=(hx,i)=>{const t=G.term(i);return `M${hx-17} ${G.headY+6} C${hx-17} ${G.headY-70} ${t[0]} ${t[1]+95} ${t[0]} ${t[1]}`;};
+  if(G.ruler){
+    s+=`<path d="M1112 76 C1180 76 1196 44 1206 -12" fill="none" stroke="#1A0D04" stroke-opacity="0.4" stroke-width="13" transform="translate(4 6)"></path><path d="M1112 76 C1180 76 1196 44 1206 -12" fill="none" stroke="#1D1D1D" stroke-width="12" stroke-linecap="round"></path><path d="M1112 73 C1178 73 1193 42 1203 -12" fill="none" stroke="#fff" stroke-opacity="0.18" stroke-width="2"></path>
+    <g filter="url(#shs)"><rect x="372" y="60" width="744" height="32" rx="3" fill="#6B4423" stroke="#3B2411" stroke-width="1.5"></rect></g>`;
+  }
+  for(let i=0;i<6;i++){
+    const hx=i===0?G.erX:i===1?G.recX:G.recX+state.heads[i-2].d*G.ppc,d=G.wire(hx,i);
+    s+=`<path id="wsh${i}" d="${d}" fill="none" stroke="#1A0D04" stroke-opacity="0.38" stroke-width="6" transform="translate(3 5)"></path><path id="wire${i}" d="${d}" fill="none" stroke="${WCOL[i]}" stroke-width="5" stroke-linecap="round"></path><path id="whl${i}" d="${d}" fill="none" stroke="#fff" stroke-opacity="0.3" stroke-width="1.2" transform="translate(-1.2 -1)"></path>`;
+    if(G.ruler){const t=G.term(i);s+=`<circle cx="${t[0]}" cy="${t[1]}" r="10" fill="url(#brass)" stroke="#4E3A0E" stroke-width="1"></circle><circle cx="${t[0]-1}" cy="${t[1]+1}" r="5.5" fill="url(#ball)"></circle>`;}
+  }
+  // erase + record heads
+  s+=`<g transform="translate(${G.erX} ${G.headY})">${headShape()}${jewel('',0,40,6.5)}${scr(-6,-14,20*fs,'erase',-6)}</g>`;
+  s+=`<g transform="translate(${G.recX} ${G.headY})">${headShape()}${jewel('id="recLamp"',0,40,7.5)}${scr(2,G.ruler?-34:-14,32*fs,'REC',3,'fill="#9E1E12"').replace(`fill="${INK}"`,'')}</g>`;
+  // playback heads (draggable)
+  for(let i=0;i<4;i++){
+    s+=`<g id="head${i}" class="ctl drag" tabindex="0" role="slider" aria-label="Playback head ${i+1} position" aria-valuemin="${MIN_D}" aria-valuemax="${MAX_D}">
+    <rect class="ring" x="-36" y="-6" width="72" height="88" rx="10"></rect>${headShape()}
+    ${jewel('class="lamp"',0,40,7.5)}
+    ${G.ruler?scr(0,-36,30,'play '+(i+1),i%2?2:-3)+note(2,-8,28,'','', 'class="ms"'):note(0,-14,34,'','','class="ms"')}</g>`;
+  }
+  // motor
+  const m=G.motor;
+  s+=toggle('motor',m.x,m.y,m.s,'Motor')+ink(m.go[0],m.go[1],34*fs,'GO',-8)+ink(m.stop[0],m.stop[1],28*fs,'stop',-5)+ink(m.name[0],m.name[1],36*fs,'motor',2);
+  // knobs
+  const k=G.speed;
+  s+=knob('speed',k.x,k.y,k.r,'Tape speed')+ink(k.x-k.r*1.85,k.side,24*fs,'slow',-6)+ink(k.x+k.r*1.9,k.side,24*fs,'fast',5)+ink(k.x,k.name,36*fs,'speed',-2)+note(k.x,k.note,30*fs,'',2,'id="speedNote"');
+  s+=knob('rec',G.rec.x,G.rec.y,G.rec.r,'Record level')+ink(G.rec.x-4,G.rec.name,28*fs,'rec level',-3);
+  s+=knob('wob',G.wob.x,G.wob.y,G.wob.r,'Wobble (wow and flutter)')+ink(G.wob.x+4,G.wob.name,28*fs,'wobble',3);
+  // source switch
+  const c=G.src;
+  s+=jewel('id="srcLamp"',c.lx,c.ly,8*c.s)+toggle('src',c.tx,c.ty,c.s,'Input: microphone or test sound')
+    +ink(c.tx+48*c.s,c.ty-16*c.s,24*fs,'mic',-4)+ink(c.tx+50*c.s,c.ty+26*c.s,24*fs,'test',3)
+    +note(c.status[0],c.status[1],28*fs,'',-1,'id="status" style="text-anchor:start"');
+  // mixer
+  const f=G.fad;
+  for(let i=0;i<5;i++){
+    const x=f.xs[i];
+    s+=fader('fad'+i,x,f.y,f.w,f.h,i<4?'Playback head '+(i+1)+' level':'Master level');
+    s+=ink(x,f.lblY,(i<4?34:30)*fs,i<4?String(i+1):'master',[-4,3,-2,4,-3][i]);
+    if(i<4)s+=toggle('tog'+i,x-12*f.togS,f.togY,f.togS,'Playback head '+(i+1)+' on or off')+jewel('id="mixLamp'+i+'"',x+27*f.togS,f.togY,6.5*f.togS);
+  }
+  if(G.ruler)s+=ink(1400,640,22,'on / off',4);
+  svg.innerHTML=s;
+  ['motor','speed','rec','wob','src','status','speedNote','recLamp','srcLamp'].forEach(id=>{el[id]=svg.querySelector('#'+id);});
+  for(let i=0;i<5;i++){el['fad'+i]=svg.querySelector('#fad'+i);if(i<4){el['tog'+i]=svg.querySelector('#tog'+i);el['head'+i]=svg.querySelector('#head'+i);el['mixLamp'+i]=svg.querySelector('#mixLamp'+i);}}
+  el.wires=[];for(let i=0;i<4;i++)el.wires.push(['wsh','wire','whl'].map(p=>svg.querySelector('#'+p+(i+2))));
+  renderWood();bind();updateAll();
+}
+
+/* ---------- updates ---------- */
+function setBat(g,on){const b=g.querySelector('.bat'),t=b.getAttribute('transform').replace(/ scale\(.*\)/,'');b.setAttribute('transform',t+` scale(1 ${on?1:-1})`);g.setAttribute('aria-checked',on?'true':'false');}
+function setKnob(g,v,cx,cy){g.querySelector('.ptr').setAttribute('transform',`rotate(${-135+270*v} ${cx} ${cy})`);g.setAttribute('aria-valuenow',Math.round(v*100));}
+function fmtMs(d){const ms=d/speedCm()*1000;return ms>=1000?(ms/1000).toFixed(2)+' s':Math.round(ms)+' ms';}
+function updateAll(){
+  setBat(el.motor,state.motor);setBat(el.src,state.src==='mic');
+  setKnob(el.speed,state.speed,G.speed.x,G.speed.y);setKnob(el.rec,state.rec,G.rec.x,G.rec.y);setKnob(el.wob,state.wob,G.wob.x,G.wob.y);
+  el.speed.setAttribute('aria-valuetext',speedCm().toFixed(1)+' centimetres per second');
+  el.speedNote.textContent=speedCm().toFixed(1)+' cm/s';
+  const f=G.fad;
+  for(let i=0;i<5;i++){
+    const v=i<4?state.heads[i].g:state.master,g=el['fad'+i];
+    g.querySelector('.cap').setAttribute('transform',`translate(${f.xs[i]} ${f.y+f.h*0.9-v*f.h*0.8})`);g.setAttribute('aria-valuenow',Math.round(v*100));
+  }
+  for(let i=0;i<4;i++){
+    const h=state.heads[i],g=el['head'+i];
+    g.setAttribute('transform',`translate(${G.recX+h.d*G.ppc} ${G.headY})`);
+    g.setAttribute('aria-valuenow',h.d.toFixed(1));g.setAttribute('aria-valuetext',h.d.toFixed(1)+' cm, '+fmtMs(h.d));
+    g.querySelector('.ms').textContent=(G.ruler?'':(i+1)+': ')+fmtMs(h.d)+(h.on?'':' (off)');
+    setLamp(g.querySelector('.lamp'),h.on?'g':'off');{const d=G.wire(G.recX+h.d*G.ppc,i+2);el.wires[i].forEach(p=>p.setAttribute('d',d));}
+    setLamp(el['mixLamp'+i],h.on?'g':'off');
+    setBat(el['tog'+i],h.on);
+  }
+  const live=!!A.ctx&&state.motor;
+  setLamp(el.recLamp,live?'r':'rd');
+  setLamp(el.srcLamp,A.ctx?(state.src==='mic'?'r':'g'):'off');
+  el.status.textContent=A.msg;
+}
+
+/* ---------- interaction ---------- */
+function pt(e){const m=svg.getScreenCTM();return new DOMPoint(e.clientX,e.clientY).matrixTransform(m.inverse());}
+function drag(g,onStart,onMove){
+  g.addEventListener('pointerdown',e=>{
+    e.preventDefault();try{g.focus({preventScroll:true});g.setPointerCapture(e.pointerId);}catch(_){}
+    const p0=pt(e),ctx=onStart(p0);
+    const mv=ev=>{onMove(pt(ev),p0,ctx);pushParams();updateAll();};
+    const up=()=>{g.removeEventListener('pointermove',mv);g.removeEventListener('pointerup',up);g.removeEventListener('pointercancel',up);save();};
+    g.addEventListener('pointermove',mv);g.addEventListener('pointerup',up);g.addEventListener('pointercancel',up);
+  });
+}
+const clamp01=v=>Math.min(1,Math.max(0,v));
+function keys(g,get,set,step,lo,hi){
+  g.addEventListener('keydown',e=>{
+    let d=0;if(e.key==='ArrowUp'||e.key==='ArrowRight')d=step;else if(e.key==='ArrowDown'||e.key==='ArrowLeft')d=-step;else return;
+    e.preventDefault();set(Math.min(hi,Math.max(lo,get()+d)));pushParams();updateAll();save();
+  });
+}
+function press(g,fn){
+  g.addEventListener('click',e=>{e.preventDefault();fn();});
+  g.addEventListener('keydown',e=>{if(e.key===' '||e.key==='Enter'){e.preventDefault();fn();}});
+}
+function bind(){
+  press(el.motor,()=>{
+    state.motor=state.motor?0:1;
+    if(!A.ctx){A.msg='starting…';initAudio().then(()=>{pushParams();updateAll();});}
+    else if(A.ctx.state!=='running')A.ctx.resume();
+    pushParams();updateAll();
+  });
+  press(el.src,()=>{const next=state.src==='mic'?'test':'mic';if(next==='mic'&&A.ctx&&!A.micOk)A.msg='asking for the mic…';useSource(next).then(save);});
+  [['speed',G.speed],['rec',G.rec],['wob',G.wob]].forEach(([k,geo])=>{
+    drag(el[k],()=>state[k],(p,p0,v0)=>{state[k]=clamp01(v0+(p0.y-p.y+(p.x-p0.x)*0.5)/(geo.r*4.5));});
+    keys(el[k],()=>state[k],v=>{state[k]=v;},0.02,0,1);
+    el[k].addEventListener('wheel',e=>{e.preventDefault();state[k]=clamp01(state[k]-Math.sign(e.deltaY)*0.02);pushParams();updateAll();save();},{passive:false});
+  });
+  const f=G.fad;
+  for(let i=0;i<5;i++){
+    const get=()=>i<4?state.heads[i].g:state.master,set=v=>{if(i<4)state.heads[i].g=v;else state.master=v;};
+    const fromY=y=>clamp01((f.y+f.h*0.9-y)/(f.h*0.8));
+    drag(el['fad'+i],p0=>{const capY=f.y+f.h*0.9-get()*f.h*0.8;if(Math.abs(p0.y-capY)>f.h*0.09){set(fromY(p0.y));pushParams();updateAll();return 0;}return capY-p0.y;},(p,p0,off)=>{set(fromY(p.y+off));});
+    keys(el['fad'+i],get,set,0.03,0,1);
+    if(i<4){
+      press(el['tog'+i],()=>{state.heads[i].on=state.heads[i].on?0:1;pushParams();updateAll();save();});
+      drag(el['head'+i],()=>state.heads[i].d,(p,p0,d0)=>{state.heads[i].d=Math.min(MAX_D,Math.max(MIN_D,d0+(p.x-p0.x)/G.ppc));});
+      keys(el['head'+i],()=>state.heads[i].d,v=>{state.heads[i].d=v;},0.25,MIN_D,MAX_D);
+    }
+  }
+}
+
+/* ---------- animation ---------- */
+let simX=0,simV=0,lastT=performance.now(),dirty=true,scale=1;
+const anim=document.getElementById('anim'),actx=anim.getContext('2d');
+// everything that moves every frame is painted here, so the board itself is never redrawn
+function drawAnim(px,off){
+  const c=actx,cy=(G.topY+G.botY)/2,R=G.R,r=R-6,a0=px/R;
+  c.setTransform(1,0,0,1,0,0);c.clearRect(0,0,anim.width,anim.height);c.setTransform(scale,0,0,scale,0,0);
+  [G.dl,G.dr].forEach(cx=>{
+    c.fillStyle='#3E2A16';
+    for(let i=0;i<3;i++){const a=a0+i*2.0944;c.beginPath();c.arc(cx+Math.sin(a)*r*0.52,cy-Math.cos(a)*r*0.52,r*0.135,0,6.2832);c.fill();}
+    c.strokeStyle='#565B61';c.lineWidth=3;c.beginPath();c.moveTo(cx+Math.sin(a0)*r*0.8,cy-Math.cos(a0)*r*0.8);c.lineTo(cx+Math.sin(a0)*r*0.93,cy-Math.cos(a0)*r*0.93);c.stroke();
+  });
+  c.lineWidth=10;c.setLineDash([]);
+  c.save();c.translate(2,3);c.strokeStyle='rgba(26,13,4,0.45)';c.stroke(G.p2);c.restore();
+  c.strokeStyle='#2C1A12';c.stroke(G.p2);
+  c.save();c.translate(-0.5,-3.2);c.lineWidth=1.6;c.strokeStyle='rgba(205,165,135,0.4)';c.stroke(G.p2);c.restore();c.lineWidth=10;
+  c.strokeStyle='rgba(122,84,64,0.6)';c.setLineDash([5,G.per-5]);c.lineDashOffset=off;c.stroke(G.p2);
+  c.strokeStyle='#F1EBDD';c.setLineDash([16,G.len-16]);c.lineDashOffset=off;c.stroke(G.p2);c.setLineDash([]);
+  if(G.vu){const a=vis.needle*Math.PI/180;c.strokeStyle='#111';c.lineWidth=2;c.beginPath();c.moveTo(1434+Math.sin(a)*14,162-Math.cos(a)*14);c.lineTo(1434+Math.sin(a)*78,162-Math.cos(a)*78);c.stroke();}
+}
+function frame(now){
+  const dt=Math.min(0.1,(now-lastT)/1000);lastT=now;
+  // the picture runs on its own smooth clock; the engine only tells it how fast the tape is going
+  const vt=vis.live?vis.v:(state.motor?speedCm():0);
+  simV+=(vt-simV)*Math.min(1,dt*(vis.live?12:4));simX+=simV*dt;
+  const px=simX*G.ppc,off=-(px%G.len);
+  let nt=-48;if(G.vu){const db=20*Math.log10(Math.max(vis.outPk,1e-4));nt=Math.min(1,Math.max(0,(db+40)/43))*96-48;}
+  const nd=Math.abs(nt-vis.needle)>0.05;vis.needle+=(nt-vis.needle)*0.25;vis.outPk*=0.93;
+  if(simV>0.001||nd||dirty){dirty=false;drawAnim(px,off);}
+  requestAnimationFrame(frame);
+}
+
+/* ---------- fit ---------- */
+function fit(){
+  const w=window.innerWidth,h=window.innerHeight;
+  const next=(w/h>1.75&&h<560)?'phone':'desk';
+  if(next!==mode||!svg.firstChild){mode=next;G=LAY[mode];render();}
+  const wrap=document.getElementById('wrap'),cs=getComputedStyle(wrap);
+  const aw=wrap.clientWidth-parseFloat(cs.paddingLeft)-parseFloat(cs.paddingRight),ah=wrap.clientHeight-parseFloat(cs.paddingTop)-parseFloat(cs.paddingBottom);
+  const k=Math.min(aw/G.W,ah/G.H);
+  stage.style.width=Math.floor(G.W*k)+'px';stage.style.height=Math.floor(G.H*k)+'px';
+  const dpr=Math.min(2,window.devicePixelRatio||1);anim.width=Math.max(1,Math.round(G.W*k*dpr));anim.height=Math.max(1,Math.round(G.H*k*dpr));scale=anim.width/G.W;dirty=true;
+  hint.hidden=!(w<h&&w<700);
+}
+window.addEventListener('resize',fit);window.addEventListener('orientationchange',()=>setTimeout(fit,200));
+fit();requestAnimationFrame(frame);
+})();
+</script>
+
+</body></html>
